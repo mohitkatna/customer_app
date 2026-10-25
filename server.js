@@ -8,6 +8,7 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const { Pool } = require("pg");
+const Razorpay = require("razorpay");
 const admin = require("firebase-admin");
 
 const app = express();
@@ -19,7 +20,17 @@ app.use(express.json({ limit: "2mb" }));
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
+let razorpay = null;
 
+if (
+  process.env.RAZORPAY_KEY_ID &&
+  process.env.RAZORPAY_KEY_SECRET
+) {
+  razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET,
+  });
+}
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "dev-only-change-me";
 
