@@ -1296,329 +1296,189 @@ app.post(
 // CREATE ORDER
 // ============================================================
 
+
 app.post(
   "/api/orders",
   auth,
   roles("customer"),
   async (req, res) => {
-    const client =
-      await pool.connect();
+    const client = await pool.connect();
+    let transactionStarted = false;
 
     try {
-      const {
-        shopId,
-        items,
-        address,
-        prescriptionUrl,
-      } = req.body;
+      if (!razorpay) {
+        return res.status(503).json({
+          error: "Razorpay is not configured on the server.",
+        });
+      }
 
+      const { shopId, items, address, prescriptionUrl } = req.body;
+
+      if (!shopId || !Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({
+          error: "shopId and items are required.",
+        });
+      }
+
+      if (!address || typeof address !== "object" ||
+          !String(address.fullAddress || "").trim()) {
+        return res.status(400).json({
+          error: "A delivery address is required.",
+        });
+      }
+
+      const productIds = items.map((item) => String(item.productId || ""));
       if (
-        !shopId ||
-        !Array.isArray(items) ||
-        !items.length
+        productIds.some((id) => !id) ||
+        new Set(productIds).size !== productIds.length
       ) {
         return res.status(400).json({
-          error:
-            "shopId and items required",
+          error: "Invalid or duplicate products.",
         });
       }
 
       await client.query("BEGIN");
+      transactionStarted = true;
 
-      const ids = items.map(
-        (x) => x.productId
+      const shopQ = await client.query(
+        `SELECT id FROM shops
+         WHERE id=$1 AND status='approved'`,
+        [shopId]
       );
 
-      const pq =
-        await client.query(
-          `SELECT *
-           FROM products
-           WHERE id=ANY($1::uuid[])
+      if (!shopQ.rowCount) {
+        throw new Error("Shop not found or not approved.");
+      }
+
+      const productQ = await client.query(
+        `SELECT *
+         FROM products
+         WHERE id=ANY($1::uuid[])
            AND shop_id=$2
            AND active=true
-           FOR UPDATE`,
-          [
-            ids,
-            shopId,
-          ]
-        );
+         FOR UPDATE`,
+        [productIds, shopId]
+      );
 
-      if (
-        pq.rowCount !==
-        items.length
-      ) {
-        throw new Error(
-          "Invalid products or mixed-shop order"
-        );
+      if (productQ.rowCount !== items.length) {
+        throw new Error("Some products are unavailable.");
       }
 
       let subtotal = 0;
 
       for (const item of items) {
-        const p =
-          pq.rows.find(
-            (x) =>
-              x.id ===
-              item.productId
-          );
-
-        const qty = Number(
-          item.quantity
+        const product = productQ.rows.find(
+          (p) => p.id === String(item.productId)
         );
+        const qty = Number(item.quantity);
 
-        if (
-          !Number.isInteger(qty) ||
-          qty < 1 ||
-          qty > p.stock
-        ) {
+        if (!Number.isInteger(qty) || qty < 1 || qty > Number(product.stock)) {
+          throw new Error(`Invalid stock or quantity for ${product.name}.`);
+        }
+
+        if (product.prescription_required && !prescriptionUrl) {
           throw new Error(
-            `Invalid stock/quantity for ${p.name}`
+            `Prescription is required for ${product.name}.`
           );
         }
 
-        if (
-          p.prescription_required &&
-          !prescriptionUrl
-        ) {
-          throw new Error(
-            "Prescription required"
-          );
-        }
-
-        subtotal +=
-          Number(p.price) * qty;
+        subtotal += Number(product.price) * qty;
       }
 
-      subtotal =
-        money(subtotal);
+      subtotal = money(subtotal);
+      const shopCommission = commission(subtotal);
+      const total = money(subtotal + DELIVERY_FEE);
+      const cancelUntil = new Date(
+        Date.now() + CANCEL_SECONDS * 1000
+      );
 
-      const comm =
-        commission(subtotal);
+      const orderQ = await client.query(
+        `INSERT INTO orders
+         (
+           customer_id, shop_id, status, subtotal,
+           delivery_fee, shop_commission, total,
+           cancel_until, address, prescription_url,
+           payment_status
+         )
+         VALUES ($1,$2,'pending',$3,$4,$5,$6,$7,$8,$9,'pending')
+         RETURNING *`,
+        [
+          req.user.id,
+          shopId,
+          subtotal,
+          DELIVERY_FEE,
+          shopCommission,
+          total,
+          cancelUntil,
+          address,
+          prescriptionUrl || null,
+        ]
+      );
 
-      const total =
-        money(
-          subtotal +
-            DELIVERY_FEE
-        );
-
-      const cancelUntil =
-        new Date(
-          Date.now() +
-            CANCEL_SECONDS *
-              1000
-        );
-
-      const oq =
-        await client.query(
-          `INSERT INTO orders
-           (
-             customer_id,
-             shop_id,
-             status,
-             subtotal,
-             delivery_fee,
-             shop_commission,
-             total,
-             cancel_until,
-             address,
-             prescription_url
-           )
-           VALUES(
-             $1,$2,'pending',
-             $3,$4,$5,$6,
-             $7,$8,$9
-           )
-           RETURNING *`,
-          [
-            req.user.id,
-            shopId,
-            subtotal,
-            DELIVERY_FEE,
-            comm,
-            total,
-            cancelUntil,
-            address || {},
-            prescriptionUrl ||
-              null,
-          ]
-        );
-
-      const order =
-        oq.rows[0];
+      const order = orderQ.rows[0];
 
       for (const item of items) {
-        const p =
-          pq.rows.find(
-            (x) =>
-              x.id ===
-              item.productId
-          );
+        const product = productQ.rows.find(
+          (p) => p.id === String(item.productId)
+        );
 
         await client.query(
           `INSERT INTO order_items
-           (
-             order_id,
-             product_id,
-             quantity,
-             unit_price
-           )
-           VALUES($1,$2,$3,$4)`,
-          [
-            order.id,
-            p.id,
-            item.quantity,
-            p.price,
-          ]
-        );
-
-        await client.query(
-          `UPDATE products
-           SET stock=stock-$1
-           WHERE id=$2`,
-          [
-            item.quantity,
-            p.id,
-          ]
+           (order_id, product_id, quantity, unit_price)
+           VALUES ($1,$2,$3,$4)`,
+          [order.id, product.id, Number(item.quantity), product.price]
         );
       }
 
-      await client.query(
-        `INSERT INTO financial_ledger
-         (
-           order_id,
-           owner_type,
-           owner_id,
-           entry_type,
-           amount,
-           available_at
-         )
-         VALUES
-         (
-           $1,
-           'shopkeeper',
-           (
-             SELECT owner_id
-             FROM shops
-             WHERE id=$2
-           ),
-           'shop_earning',
-           $3,
-           NOW()+INTERVAL '7 days'
-         ),
-         (
-           $1,
-           'nearkart',
-           NULL,
-           'shop_commission',
-           $4,
-           NOW()
-         ),
-         (
-           $1,
-           'delivery_pool',
-           NULL,
-           'delivery_earning',
-           $5,
-           NOW()+INTERVAL '7 days'
-         ),
-         (
-           $1,
-           'nearkart',
-           NULL,
-           'delivery_share',
-           $6,
-           NOW()
-         )`,
-        [
-          order.id,
-          shopId,
-          money(
-            subtotal -
-              comm
-          ),
-          comm,
-          DELIVERY_EARNING,
-          NEARKART_DELIVERY_SHARE,
-        ]
-      );
+      // Razorpay requires the amount in paise, not rupees.
+      const razorpayOrder = await razorpay.orders.create({
+        amount: Math.round(total * 100),
+        currency: "INR",
+        receipt: String(order.id).replace(/-/g, "").slice(0, 40),
+        notes: {
+          nearkart_order_id: String(order.id),
+          customer_id: String(req.user.id),
+        },
+      });
 
       await client.query(
         `INSERT INTO payments
-         (order_id,amount)
-         VALUES($1,$2)`,
+         (order_id, provider, provider_order_id, amount, status, raw)
+         VALUES ($1,'razorpay',$2,$3,'created',$4)`,
         [
           order.id,
+          razorpayOrder.id,
           total,
+          JSON.stringify({
+            razorpayOrderId: razorpayOrder.id,
+          }),
         ]
       );
 
-      await client.query(
-        "COMMIT"
-      );
+      await client.query("COMMIT");
+      transactionStarted = false;
 
-      const ownerQ =
-        await pool.query(
-          `SELECT
-             owner_id,
-             shop_name
-           FROM shops
-           WHERE id=$1`,
-          [shopId]
-        );
-
-      if (ownerQ.rowCount) {
-        await sendPushToUser(
-          ownerQ.rows[0]
-            .owner_id,
-          "New NearKart order",
-          `New order #${String(
-            order.id
-          ).slice(0, 8)} received`,
-          {
-            orderId: order.id,
-            status: "pending",
-          },
-          "new_order"
-        );
-      }
-
-      await sendPushToUser(
-        req.user.id,
-        "NearKart order placed",
-        "Your order has been placed successfully",
-        {
-          orderId: order.id,
-          status: "pending",
-        },
-        "order_placed"
-      );
-
-      res.status(201).json({
+      return res.status(201).json({
         orderId: order.id,
+        keyId: process.env.RAZORPAY_KEY_ID,
+        razorpayOrderId: razorpayOrder.id,
+        amount: razorpayOrder.amount,
+        currency: razorpayOrder.currency,
         subtotal,
-        deliveryFee:
-          DELIVERY_FEE,
+        deliveryFee: DELIVERY_FEE,
         total,
-        shopkeeperReceives:
-          money(
-            subtotal - comm
-          ),
-        nearkartCommission:
-          comm,
-        deliveryPartnerReceives:
-          DELIVERY_EARNING,
-        cancellationEndsAt:
-          cancelUntil,
-        payment:
-          "cashfree_required",
+        shopCommission,
+        paymentStatus: "created",
       });
     } catch (e) {
-      await client.query(
-        "ROLLBACK"
-      );
+      if (transactionStarted) {
+        await client.query("ROLLBACK");
+      }
 
-      res.status(400).json({
-        error: e.message,
+      console.error("Create order error:", e.message);
+
+      return res.status(400).json({
+        error: e.message || "Could not create order.",
       });
     } finally {
       client.release();
@@ -1626,6 +1486,340 @@ app.post(
   }
 );
 
+app.post(
+  "/api/payments/razorpay/verify",
+  auth,
+  roles("customer"),
+  async (req, res) => {
+    const client = await pool.connect();
+    let transactionStarted = false;
+
+    try {
+      const {
+        orderId,
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature,
+      } = req.body;
+
+      if (
+        !razorpay ||
+        !orderId ||
+        !razorpay_order_id ||
+        !razorpay_payment_id ||
+        !razorpay_signature
+      ) {
+        return res.status(400).json({
+          error: "Required payment details are missing.",
+        });
+      }
+
+      // Verify signature on the server; never trust the app callback alone.
+      const expectedSignature = crypto
+        .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+        .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+        .digest("hex");
+
+      const supplied = Buffer.from(razorpay_signature, "hex");
+      const expected = Buffer.from(expectedSignature, "hex");
+
+      if (
+        supplied.length !== expected.length ||
+        !crypto.timingSafeEqual(supplied, expected)
+      ) {
+        return res.status(400).json({
+          error: "Razorpay signature verification failed.",
+        });
+      }
+
+      await client.query("BEGIN");
+      transactionStarted = true;
+
+      const orderQ = await client.query(
+        `SELECT *
+         FROM orders
+         WHERE id=$1 AND customer_id=$2
+         FOR UPDATE`,
+        [orderId, req.user.id]
+      );
+
+      if (!orderQ.rowCount) {
+        throw new Error("Order not found.");
+      }
+
+      const order = orderQ.rows[0];
+
+      const paymentQ = await client.query(
+        `SELECT *
+         FROM payments
+         WHERE order_id=$1 AND provider='razorpay'
+         FOR UPDATE`,
+        [orderId]
+      );
+
+      if (!paymentQ.rowCount) {
+        throw new Error("Razorpay payment record not found.");
+      }
+
+      const payment = paymentQ.rows[0];
+
+      if (payment.provider_order_id !== razorpay_order_id) {
+        throw new Error("Razorpay order ID does not match.");
+      }
+
+      // Idempotency: a repeated callback must not decrement stock twice.
+      if (order.payment_status === "paid") {
+        await client.query("ROLLBACK");
+        transactionStarted = false;
+
+        return res.json({
+          verified: true,
+          orderId: order.id,
+          paymentStatus: "paid",
+          message: "Payment was already verified.",
+        });
+      }
+
+      if (order.payment_status !== "pending") {
+        throw new Error("This order is not awaiting payment.");
+      }
+
+      // Lock all ordered products and check stock again.
+      const itemsQ = await client.query(
+        `SELECT
+           oi.product_id,
+           oi.quantity,
+           oi.unit_price,
+           p.name,
+           p.stock,
+           p.shop_id
+         FROM order_items oi
+         JOIN products p ON p.id=oi.product_id
+         WHERE oi.order_id=$1
+         FOR UPDATE OF p`,
+        [orderId]
+      );
+
+      if (!itemsQ.rowCount) {
+        throw new Error("Order has no items.");
+      }
+
+      const stockIssue = itemsQ.rows.some(
+        (item) => Number(item.stock) < Number(item.quantity)
+      );
+
+      // Record the verified payment even if stock has changed.
+      // In that unusual case, hold the order for manual resolution.
+      await client.query(
+        `UPDATE payments
+         SET status='paid',
+             raw=$1
+         WHERE id=$2`,
+        [
+          JSON.stringify({
+            razorpay_order_id,
+            razorpay_payment_id,
+            signature_verified: true,
+          }),
+          payment.id,
+        ]
+      );
+
+      if (stockIssue) {
+        await client.query(
+          `UPDATE orders
+           SET payment_status='paid',
+               status='payment_review'
+           WHERE id=$1`,
+          [orderId]
+        );
+
+        await client.query("COMMIT");
+        transactionStarted = false;
+
+        await sendPushToUser(
+          req.user.id,
+          "Payment received",
+          "Your payment was verified. The order needs a stock review; please contact NearKart support.",
+          { orderId, status: "payment_review" },
+          "payment_review"
+        );
+
+        return res.json({
+          verified: true,
+          needsReview: true,
+          orderId,
+          paymentStatus: "paid",
+          message: "Payment verified; order needs stock review.",
+        });
+      }
+
+      for (const item of itemsQ.rows) {
+        await client.query(
+          `UPDATE products
+           SET stock=stock-$1
+           WHERE id=$2`,
+          [Number(item.quantity), item.product_id]
+        );
+      }
+
+      const shopCommission = Number(order.shop_commission);
+      const subtotal = Number(order.subtotal);
+
+      await client.query(
+        `INSERT INTO financial_ledger
+         (
+           order_id, owner_type, owner_id, entry_type,
+           amount, available_at
+         )
+         VALUES
+         (
+           $1, 'shopkeeper',
+           (SELECT owner_id FROM shops WHERE id=$2),
+           'shop_earning', $3, NOW()+INTERVAL '7 days'
+         ),
+         (
+           $1, 'nearkart', NULL,
+           'shop_commission', $4, NOW()
+         ),
+         (
+           $1, 'delivery_pool', NULL,
+           'delivery_earning', $5, NOW()+INTERVAL '7 days'
+         ),
+         (
+           $1, 'nearkart', NULL,
+           'delivery_share', $6, NOW()
+         )`,
+        [
+          orderId,
+          order.shop_id,
+          money(subtotal - shopCommission),
+          shopCommission,
+          DELIVERY_EARNING,
+          NEARKART_DELIVERY_SHARE,
+        ]
+      );
+
+      await client.query(
+        `UPDATE orders
+         SET payment_status='paid',
+             status='pending'
+         WHERE id=$1`,
+        [orderId]
+      );
+
+      await client.query("COMMIT");
+      transactionStarted = false;
+
+      const shopQ = await pool.query(
+        `SELECT owner_id
+         FROM shops
+         WHERE id=$1`,
+        [order.shop_id]
+      );
+
+      if (shopQ.rowCount) {
+        await sendPushToUser(
+          shopQ.rows[0].owner_id,
+          "New NearKart order",
+          `Paid order #${String(orderId).slice(0, 8)} received`,
+          { orderId, status: "pending" },
+          "new_order"
+        );
+      }
+
+      await sendPushToUser(
+        req.user.id,
+        "Payment successful",
+        "Your NearKart payment was verified and your order is placed.",
+        { orderId, status: "pending" },
+        "payment_success"
+      );
+
+      return res.json({
+        verified: true,
+        orderId,
+        paymentStatus: "paid",
+        message: "Payment verified and order placed.",
+      });
+    } catch (e) {
+      if (transactionStarted) {
+        await client.query("ROLLBACK");
+      }
+
+      console.error("Razorpay verification error:", e.message);
+
+      return res.status(400).json({
+        error: e.message || "Payment verification failed.",
+      });
+    } finally {
+      client.release();
+    }
+  }
+);
+
+ // ============================================================
+ // GET CUSTOMER ORDERS
+ // ============================================================
+
+app.get(
+  "/api/orders",
+  auth,
+  roles("customer"),
+  async (req, res) => {
+    try {
+      const q = await pool.query(
+        `SELECT
+           o.id,
+           o.shop_id,
+           s.shop_name,
+           o.status,
+           o.subtotal,
+           o.delivery_fee,
+           o.total,
+           o.payment_status,
+           o.address,
+           o.created_at,
+           o.cancel_until,
+           COALESCE(
+             (
+               SELECT json_agg(
+                 json_build_object(
+                   'productId', oi.product_id,
+                   'name', p.name,
+                   'quantity', oi.quantity,
+                   'unitPrice', oi.unit_price,
+                   'images', p.images
+                 )
+               )
+               FROM order_items oi
+               LEFT JOIN products p
+                 ON p.id = oi.product_id
+               WHERE oi.order_id = o.id
+             ),
+             '[]'::json
+           ) AS items
+         FROM orders o
+         LEFT JOIN shops s
+           ON s.id = o.shop_id
+         WHERE o.customer_id = $1
+         ORDER BY o.created_at DESC
+         LIMIT 100`,
+        [req.user.id]
+      );
+
+      return res.json(q.rows);
+    } catch (e) {
+      console.error("Get customer orders error:", e.message);
+
+      return res.status(500).json({
+        error: "Could not load orders."
+      });
+    }
+  }
+);
+
+           
 // ============================================================
 // CANCEL ORDER
 // ============================================================
