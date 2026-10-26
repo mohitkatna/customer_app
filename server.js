@@ -12,7 +12,14 @@ const Razorpay = require("razorpay");
 const admin = require("firebase-admin");
 
 const app = express();
-
+app.get("/", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "NearKart API",
+    message: "Backend is running successfully",
+    health: "/api/health"
+  });
+});
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
